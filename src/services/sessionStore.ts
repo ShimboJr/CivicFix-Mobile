@@ -10,9 +10,18 @@
  *     foreground service) and therefore has access to all native modules.
  *
  * Storage keys:
- *   civicfix_active_session_id  — MongoDB ObjectId string of the live session
- *   civicfix_session_expires_at — ISO 8601 timestamp string (expiresAt)
- *   civicfix_active_report_id   — linked EmergencyReport id (for deep-link use)
+ *   civicfix_active_session_id      — MongoDB ObjectId string of the live session
+ *   civicfix_session_expires_at     — ISO 8601 timestamp string (expiresAt)
+ *   civicfix_active_report_id       — linked EmergencyReport id (for deep-link use)
+ *   civicfix_last_seen_msg_at       — ISO 8601 timestamp of the most-recently
+ *                                     displayed admin message (written by the screen;
+ *                                     read by postPing to include as lastSeenMessageAt
+ *                                     so the backend only returns NEW messages)
+ *   civicfix_pending_messages       — JSON array of SessionMessage objects written
+ *                                     by postPing after a successful ping; read and
+ *                                     cleared by the foreground screen.  This is the
+ *                                     bridge that lets a single network call (the ping)
+ *                                     deliver messages without a separate API poll.
  *
  * The auth JWT is stored separately by the AuthContext under its own key
  * ('civicfix_sos_auth_token') — imported here so the background task has a
@@ -22,10 +31,13 @@
 import * as SecureStore from 'expo-secure-store';
 
 export const StorageKeys = {
-  AUTH_TOKEN:   'civicfix_sos_auth_token',   // set by AuthContext
-  SESSION_ID:   'civicfix_active_session_id',
-  EXPIRES_AT:   'civicfix_session_expires_at',
-  REPORT_ID:    'civicfix_active_report_id',
+  AUTH_TOKEN:        'civicfix_sos_auth_token',   // set by AuthContext
+  SESSION_ID:        'civicfix_active_session_id',
+  EXPIRES_AT:        'civicfix_session_expires_at',
+  REPORT_ID:         'civicfix_active_report_id',
+  // Message-delivery bridge (background task ↔ foreground screen)
+  LAST_SEEN_MSG_AT:  'civicfix_last_seen_msg_at',
+  PENDING_MESSAGES:  'civicfix_pending_messages',
 } as const;
 
 // ── Write ──────────────────────────────────────────────────────────────────────
@@ -65,6 +77,53 @@ export async function loadActiveSession(): Promise<ActiveSessionData | null> {
   return { sessionId, expiresAt, reportId };
 }
 
+// ── Message-delivery bridge ───────────────────────────────────────────────────
+// Written by the foreground screen; read by postPing (background task).
+
+/**
+ * Persist the ISO timestamp of the most recently displayed admin message.
+ * postPing reads this on each ping so the backend only returns newer messages.
+ */
+export async function saveLastSeenMessageAt(isoTimestamp: string): Promise<void> {
+  await SecureStore.setItemAsync(StorageKeys.LAST_SEEN_MSG_AT, isoTimestamp);
+}
+
+/**
+ * Read the last-seen message timestamp.  Returns null if never set.
+ */
+export async function loadLastSeenMessageAt(): Promise<string | null> {
+  return SecureStore.getItemAsync(StorageKeys.LAST_SEEN_MSG_AT);
+}
+
+/**
+ * Written by postPing after a successful ping that returned new messages.
+ * The foreground screen reads this key on a fast local interval — no network.
+ *
+ * @param messages - Array of SessionMessage objects received from the ping.
+ */
+export async function savePendingMessages(messages: unknown[]): Promise<void> {
+  await SecureStore.setItemAsync(
+    StorageKeys.PENDING_MESSAGES,
+    JSON.stringify(messages),
+  );
+}
+
+/**
+ * Read and immediately clear the pending-messages queue.
+ * Returns an empty array when nothing is pending.
+ */
+export async function drainPendingMessages<T = unknown>(): Promise<T[]> {
+  const raw = await SecureStore.getItemAsync(StorageKeys.PENDING_MESSAGES);
+  if (!raw) return [];
+  // Clear immediately so a second concurrent drain sees nothing.
+  await SecureStore.deleteItemAsync(StorageKeys.PENDING_MESSAGES);
+  try {
+    return JSON.parse(raw) as T[];
+  } catch {
+    return [];
+  }
+}
+
 // ── Clear ──────────────────────────────────────────────────────────────────────
 
 export async function clearActiveSession(): Promise<void> {
@@ -72,5 +131,9 @@ export async function clearActiveSession(): Promise<void> {
     SecureStore.deleteItemAsync(StorageKeys.SESSION_ID),
     SecureStore.deleteItemAsync(StorageKeys.EXPIRES_AT),
     SecureStore.deleteItemAsync(StorageKeys.REPORT_ID),
+    // Also clear message-bridge keys so stale data from this session
+    // never leaks into a future session if the app is relaunched.
+    SecureStore.deleteItemAsync(StorageKeys.LAST_SEEN_MSG_AT),
+    SecureStore.deleteItemAsync(StorageKeys.PENDING_MESSAGES),
   ]);
 }

@@ -62,15 +62,16 @@ import {
   confirmSafe,
   endSession,
   fetchSessionMessages,
-  pingSession,
   saveSessionNote,
   startSession,
   type SessionMessage,
 } from '@/services/liveLocationService';
 import {
   clearActiveSession,
+  drainPendingMessages,
   loadActiveSession,
   saveActiveSession,
+  saveLastSeenMessageAt,
   type ActiveSessionData,
 } from '@/services/sessionStore';
 
@@ -121,7 +122,7 @@ export default function ActiveSessionScreen() {
   const [noteSaved, setNoteSaved]       = useState(false);
   const [noteError, setNoteError]       = useState('');
 
-  // ── Messages panel (poll-only — NO OS notification, sound, or vibration) ──
+  // ── Messages panel (delivered via ping backfill — NO OS notification, sound, or vibration) ──
   // ⚠️  STEALTH CONTRACT: these state values drive silent in-UI rendering only.
   //   Nothing here may ever call Vibration, Audio, Notifications, or any other
   //   OS-level alert mechanism.  The resident sees new messages ONLY while
@@ -141,14 +142,19 @@ export default function ActiveSessionScreen() {
   const pulseLoop = useRef<Animated.CompositeAnimation | null>(null);
 
   // Timers
-  const countdownRef  = useRef<ReturnType<typeof setInterval> | null>(null);
-  // Separate message-poll interval — must NEVER use any OS notification API.
-  const msgPollRef    = useRef<ReturnType<typeof setInterval> | null>(null);
-  // Tracks message _ids already displayed to detect new arrivals without
-  // re-rendering the entire list or touching any OS alert layer.
-  const seenMsgIdsRef = useRef<Set<string>>(new Set());
-  const elapsedRef    = useRef(0);
-  const sessionStart  = useRef(Date.now());
+  const countdownRef      = useRef<ReturnType<typeof setInterval> | null>(null);
+  // 3-second drain loop — reads PENDING_MESSAGES from SecureStore (no network).
+  // postPing writes new messages there after each successful location ping.
+  const msgDrainRef       = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Tracks message _ids already displayed to avoid duplicate renders.
+  const seenMsgIdsRef     = useRef<Set<string>>(new Set());
+  // ISO timestamp of the most recently displayed message.  Written to SecureStore
+  // so postPing can include it in the ping body (lastSeenMessageAt) and the
+  // backend returns only messages newer than this cursor.  Advanced only after
+  // successfully rendering, so a failed ping never silently drops a message.
+  const lastSeenMsgAtRef  = useRef<string | null>(null);
+  const elapsedRef        = useRef(0);
+  const sessionStart      = useRef(Date.now());
 
   // ── Mount ───────────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -163,14 +169,14 @@ export default function ActiveSessionScreen() {
       setRemaining(secondsUntil(stored.expiresAt));
       startPulse();
       startTimers(stored.expiresAt);
-      startMsgPoll(stored.sessionId);
+      startMsgDrain(stored.sessionId);
     }
     init();
 
     return () => {
       stopPulse();
       clearTimers();
-      clearMsgPoll();
+      clearMsgDrain();
     };
   }, []);
 
@@ -226,47 +232,99 @@ export default function ActiveSessionScreen() {
     }
   }
 
-  // ── Message polling ──────────────────────────────────────────────────────
+  // ── Message delivery (via ping backfill) ────────────────────────────────────
   //
   // ⚠️  STEALTH CONTRACT — read before modifying any function in this block:
   //
-  //   pollMessages MUST NOT call Vibration, Notifications, Audio, or any OS API.
-  //   New messages are silently rendered in-UI; the resident discovers them only
-  //   by looking at this screen.  Any OS-level alert would defeat the feature's
-  //   entire purpose and could endanger someone hiding their phone from a threat.
+  //   mergeMessages and all helpers MUST NOT call Vibration, Notifications,
+  //   Audio, or any OS API.  New messages are silently rendered in-UI; the
+  //   resident discovers them only by looking at this screen.
+  //
+  // How it works:
+  //   1. On mount, a one-shot GET /messages backfills any messages sent before
+  //      this screen opened (covers the gap between session start and first ping).
+  //   2. Every location ping (fired by postPing in backgroundLocation.ts) includes
+  //      `lastSeenMessageAt` from SecureStore and writes any `newMessages` back to
+  //      PENDING_MESSAGES in SecureStore.
+  //   3. A 3-second local interval (msgDrainRef) reads PENDING_MESSAGES from
+  //      SecureStore and calls mergeMessages — no network request.
+  //   4. After rendering, saveLastSeenMessageAt advances the cursor so pings never
+  //      return the same messages twice.  A failed ping leaves PENDING_MESSAGES
+  //      untouched; the next successful ping re-queues them.
 
-  async function pollMessages(sessionId: string): Promise<void> {
-    const incoming = await fetchSessionMessages(sessionId);
+  /**
+   * Merge an incoming list of SessionMessages into displayed state.
+   * Skips duplicates using seenMsgIdsRef.  Highlights the newest arrival
+   * briefly (no sound or vibration).
+   *
+   * @param incoming  - Messages from a backfill GET or drained from SecureStore.
+   * @param isBackfill - When true, the initial load: show all without highlighting.
+   */
+  function mergeMessages(incoming: SessionMessage[], isBackfill = false): void {
     if (incoming.length === 0) return;
 
-    const isFirstPoll = seenMsgIdsRef.current.size === 0;
-    const newMsgs     = incoming.filter((m) => !seenMsgIdsRef.current.has(m._id));
+    const newMsgs = incoming.filter((m) => !seenMsgIdsRef.current.has(m._id));
+    if (newMsgs.length === 0) return;  // nothing new
 
-    if (isFirstPoll || newMsgs.length > 0) {
-      // Mark all current messages as seen
-      incoming.forEach((m) => seenMsgIdsRef.current.add(m._id));
-      setMessages(incoming);
+    newMsgs.forEach((m) => seenMsgIdsRef.current.add(m._id));
+    setMessages((prev) => {
+      // Merge and re-sort by createdAt so the list stays chronological
+      // regardless of delivery order.
+      const merged = [...prev, ...newMsgs].sort(
+        (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime(),
+      );
+      return merged;
+    });
 
-      // Brief highlight for newly-arrived messages only (no sound/vibration)
-      if (!isFirstPoll && newMsgs.length > 0) {
-        const latestNew = newMsgs[newMsgs.length - 1];
-        setNewestMsgId(latestNew._id);
-        setTimeout(() => setNewestMsgId(null), 8_000);
-      }
+    // Advance the cursor to the newest new message's createdAt timestamp.
+    // SecureStore write is fire-and-forget — a failure just means the next
+    // ping may re-deliver a message mergeMessages will deduplicate anyway.
+    const newestNew = [...newMsgs].sort(
+      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+    )[0];
+    if (newestNew) {
+      lastSeenMsgAtRef.current = newestNew.createdAt;
+      void saveLastSeenMessageAt(newestNew.createdAt);
+    }
+
+    // Highlight the most recent new arrival briefly (no sound/vibration).
+    if (!isBackfill) {
+      const latestNew = newMsgs[newMsgs.length - 1];
+      setNewestMsgId(latestNew._id);
+      setTimeout(() => setNewestMsgId(null), 8_000);
     }
   }
 
-  function startMsgPoll(sessionId: string): void {
-    clearMsgPoll();
-    // Fire immediately, then every 13 seconds
-    void pollMessages(sessionId);
-    msgPollRef.current = setInterval(() => void pollMessages(sessionId), 13_000);
+  function startMsgDrain(sessionId: string): void {
+    clearMsgDrain();
+
+    // 1. One-shot backfill — fetches messages sent before this screen opened.
+    //    Error is swallowed silently; the first ping's lastSeenMessageAt=null
+    //    will cause the backend to return all messages as fallback.
+    //    Do NOT show an error UI — that would draw attention to the phone.
+    void (async () => {
+      try {
+        const backfill = await fetchSessionMessages(sessionId);
+        mergeMessages(backfill, /* isBackfill */ true);
+      } catch {
+        // Non-fatal — first ping will backfill instead.
+      }
+    })();
+
+    // 2. Fast local drain loop (3 s) — reads PENDING_MESSAGES from SecureStore.
+    //    No network call — postPing wrote this during the last location ping.
+    msgDrainRef.current = setInterval(() => {
+      void (async () => {
+        const pending = await drainPendingMessages<SessionMessage>();
+        mergeMessages(pending);
+      })();
+    }, 3_000);
   }
 
-  function clearMsgPoll(): void {
-    if (msgPollRef.current) {
-      clearInterval(msgPollRef.current);
-      msgPollRef.current = null;
+  function clearMsgDrain(): void {
+    if (msgDrainRef.current) {
+      clearInterval(msgDrainRef.current);
+      msgDrainRef.current = null;
     }
   }
 
@@ -274,7 +332,7 @@ export default function ActiveSessionScreen() {
 
   async function handleExpired() {
     clearTimers();
-    clearMsgPoll();
+    clearMsgDrain();
     stopPulse();
     await Promise.all([
       stopLocationTracking(),
@@ -303,7 +361,7 @@ export default function ActiveSessionScreen() {
   async function handleStop() {
     setIsStopping(true);
     clearTimers();
-    clearMsgPoll();
+    clearMsgDrain();
     stopPulse();
     try {
       if (session) {
@@ -326,7 +384,7 @@ export default function ActiveSessionScreen() {
   //   completely unaffected.
   //
   //   Do NOT add any of the following here:
-  //     - stopLocationTracking()  - clearTimers() / clearMsgPoll()
+  //     - stopLocationTracking()  - clearTimers() / clearMsgDrain()
   //     - stopPulse()             - clearActiveSession()
   //     - router.replace(...)     - setIsStopping(true)
 
@@ -417,11 +475,12 @@ export default function ActiveSessionScreen() {
       const tracking = await isLocationTrackingActive();
       if (!tracking) await startLocationTracking();
 
-      // 6. Update local state, restart timers, and restart message poll
+      // 6. Update local state, restart timers, and restart message drain
       clearTimers();
-      clearMsgPoll();
+      clearMsgDrain();
       // Reset message state so stale messages from the old session don't linger
       seenMsgIdsRef.current = new Set();
+      lastSeenMsgAtRef.current = null;
       setMessages([]);
       setNewestMsgId(null);
       setSafeConfirmed(false);
@@ -432,7 +491,7 @@ export default function ActiveSessionScreen() {
       setRemaining(secondsUntil(newSessionData.expiresAt));
       setPingCount(0);
       startTimers(newSessionData.expiresAt);
-      startMsgPoll(newStored.sessionId);
+      startMsgDrain(newStored.sessionId);
 
     } catch (err) {
       Alert.alert(

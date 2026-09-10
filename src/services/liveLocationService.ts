@@ -65,7 +65,7 @@ export interface PingParams {
 }
 
 export type PingResult =
-  | { ok: true }
+  | { ok: true;  newMessages: SessionMessage[] }
   | { ok: false; expired: boolean; message: string };
 
 /**
@@ -107,7 +107,13 @@ export async function pingSession(params: PingParams): Promise<PingResult> {
     };
   }
 
-  if (response.ok) return { ok: true };
+  if (response.ok) {
+    const body = await response.json().catch(() => ({})) as {
+      message?:     string;
+      newMessages?: SessionMessage[];
+    };
+    return { ok: true, newMessages: body.newMessages ?? [] };
+  }
 
   if (response.status === 410) {
     return { ok: false, expired: true, message: 'Session has expired or ended' };
@@ -179,17 +185,16 @@ export interface SessionMessage {
 /**
  * Fetches all messages for a live-location session, oldest first.
  *
- * Called by the foreground polling loop in ActiveSessionScreen — intentionally
- * using the axios instance (not raw fetch) because this is always a foreground
- * call made while the screen is visible.
+ * Used for the one-shot backfill on mount (before the first location ping
+ * has been delivered via the background task).  After that, messages arrive
+ * via the ping response stored in SecureStore — no repeated network calls.
  *
  * ⚠️  Stealth contract:
  *   The caller MUST NOT trigger any OS notification, sound, or vibration when
  *   new messages arrive.  Messages must be silently displayed in-UI only if the
  *   resident is already looking at this screen.
  *
- * Returns an empty array on any network error so the polling loop can continue
- * without interrupting the session.
+ * Returns an empty array on any network error so the session is not interrupted.
  */
 export async function fetchSessionMessages(
   sessionId: string,

@@ -38,7 +38,12 @@ import * as SecureStore from 'expo-secure-store';
 import Constants from 'expo-constants';
 
 import { API_BASE_URL, Endpoints } from '@/config/api';
-import { StorageKeys, clearActiveSession } from '@/services/sessionStore';
+import {
+  StorageKeys,
+  clearActiveSession,
+  loadLastSeenMessageAt,
+  savePendingMessages,
+} from '@/services/sessionStore';
 
 // ── Environment detection ─────────────────────────────────────────────────────
 
@@ -66,6 +71,13 @@ let _foregroundSubscription: Location.LocationSubscription | null = null;
  * Handles 410 Gone by clearing session state and stopping tracking.
  * Network failures are logged but non-fatal — the next event will retry.
  *
+ * Piggybacked message delivery:
+ *   Reads `lastSeenMessageAt` from SecureStore (written by the foreground screen
+ *   after it displays a message), includes it in the ping body, then stores any
+ *   `newMessages` from the response back into SecureStore under PENDING_MESSAGES.
+ *   The foreground screen drains that key on a fast local interval — no extra
+ *   network call is needed.  When no new messages arrive, nothing is written.
+ *
  * Logging note: console.error is used for failures because Hermes silences
  * console.warn in non-debuggable release builds at the native log layer.
  * console.error is always routed through the native crash-reporter bridge
@@ -76,9 +88,10 @@ async function postPing(
   longitude: number,
   accuracy:  number | null | undefined,
 ): Promise<void> {
-  const [sessionId, token] = await Promise.all([
+  const [sessionId, token, lastSeenMessageAt] = await Promise.all([
     SecureStore.getItemAsync(StorageKeys.SESSION_ID),
     SecureStore.getItemAsync(StorageKeys.AUTH_TOKEN),
+    loadLastSeenMessageAt(),          // null when no message has ever been shown
   ]);
 
   if (!sessionId || !token) {
@@ -96,6 +109,7 @@ async function postPing(
     `[CivicFix SOS] Ping → session …${sessionId.slice(-6)}`,
     `lat=${latitude.toFixed(5)} lng=${longitude.toFixed(5)}`,
     `acc=${accuracy?.toFixed(0) ?? '?'}m`,
+    lastSeenMessageAt ? `lastSeenMsg=${lastSeenMessageAt}` : 'firstPing',
     `url=${pingUrl}`,
   );
 
@@ -108,7 +122,16 @@ async function postPing(
           Authorization:  `Bearer ${token}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ latitude, longitude, accuracy }),
+        // Include lastSeenMessageAt so the backend returns only messages
+        // newer than what the screen has already displayed.  Sending null
+        // on the first ping is intentional — the backend interprets a
+        // missing / null value as "return everything" (backfill mode).
+        body: JSON.stringify({
+          latitude,
+          longitude,
+          accuracy,
+          ...(lastSeenMessageAt != null && { lastSeenMessageAt }),
+        }),
       },
     );
 
@@ -128,8 +151,24 @@ async function postPing(
       return;
     }
 
-    // Explicit success log — confirms the full round-trip worked.
-    console.log(`[CivicFix SOS] Ping OK (${response.status}) — session …${sessionId.slice(-6)}`);
+    // Parse the response body to extract any piggybacked messages.
+    const responseBody = await response.json().catch(() => ({})) as {
+      message?: string;
+      newMessages?: unknown[];
+    };
+
+    // Write new messages to SecureStore so the foreground screen can drain
+    // them without making its own network call.  Only write when there are
+    // actually messages to avoid unnecessary SecureStore churn.
+    if (responseBody.newMessages && responseBody.newMessages.length > 0) {
+      await savePendingMessages(responseBody.newMessages);
+      console.log(
+        `[CivicFix SOS] Ping OK — ${responseBody.newMessages.length} new message(s) queued`,
+      );
+    } else {
+      // Explicit success log — confirms the full round-trip worked.
+      console.log(`[CivicFix SOS] Ping OK (${response.status}) — session …${sessionId.slice(-6)}`);
+    }
   } catch (err) {
     // Network-level failure (no response received).
     console.error('[CivicFix SOS] Ping NETWORK ERROR:', (err as Error).message);
