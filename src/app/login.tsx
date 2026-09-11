@@ -20,6 +20,7 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import { useAuth } from '@/context/AuthContext';
+import BrandMark from '@/components/BrandMark';
 
 // ---------------------------------------------------------------------------
 // CivicFix brand palette — teal primary, amber accent
@@ -90,15 +91,20 @@ export default function LoginScreen() {
 
           {/* ── Hero ──────────────────────────────────────────────── */}
           <View style={styles.hero}>
-            <View style={styles.logoOuter}>
-              <View style={styles.logoInner}>
-                <Text style={styles.logoLabel}>CF</Text>
-              </View>
-              {/* Amber accent dot */}
-              <View style={styles.amberDot} />
+            {/* Real logo icon — same SVG as web favicon, no accent dot */}
+            <BrandMark size={72} />
+
+            {/*
+              Two-tone wordmark matching web's .cf-auth-logo markup:
+                <span class="logo-text">Civic<span>Fix</span></span>
+              «Civic» in textDark, «Fix» in amber, « SOS» smaller + textDark.
+            */}
+            <View style={styles.wordmarkRow}>
+              <Text style={styles.wordmarkCivic}>Civic</Text>
+              <Text style={styles.wordmarkFix}>Fix</Text>
+              <Text style={styles.wordmarkSos}> SOS</Text>
             </View>
 
-            <Text style={styles.appName}>CivicFix SOS</Text>
             <Text style={styles.tagline}>
               Emergency location sharing{'\n'}for your safety
             </Text>
@@ -231,51 +237,34 @@ const styles = StyleSheet.create({
     paddingBottom: 28,
     gap: 10,
   },
-  logoOuter: {
-    width: 84,
-    height: 84,
-    borderRadius: 26,
-    backgroundColor: Brand.teal,
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginBottom: 4,
-    shadowColor: Brand.teal,
-    shadowOffset: { width: 0, height: 8 },
-    shadowOpacity: 0.38,
-    shadowRadius: 18,
-    elevation: 12,
+
+  // ── Wordmark
+  wordmarkRow: {
+    flexDirection: 'row',
+    alignItems: 'baseline',
+    marginTop: 4,
   },
-  logoInner: {
-    width: 54,
-    height: 54,
-    borderRadius: 16,
-    backgroundColor: 'rgba(255,255,255,0.18)',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  logoLabel: {
-    fontSize: 22,
-    fontWeight: '800',
-    color: '#FFFFFF',
-    letterSpacing: 1.5,
-  },
-  // Small amber accent dot positioned top-right of logo
-  amberDot: {
-    position: 'absolute',
-    top: 8,
-    right: 8,
-    width: 14,
-    height: 14,
-    borderRadius: 7,
-    backgroundColor: Brand.amber,
-    borderWidth: 2,
-    borderColor: Brand.tealXLight,
-  },
-  appName: {
+  // «Civic» — same dark body colour as web's .logo-text (var(--cf-text) → textDark)
+  wordmarkCivic: {
     fontSize: 30,
     fontWeight: '800',
     color: Brand.textDark,
-    letterSpacing: -0.6,
+    letterSpacing: -0.5,
+  },
+  // «Fix» — amber accent, matching web's .logo-text span (var(--cf-accent))
+  // Reuses Brand.amber already defined above — no new hex value.
+  wordmarkFix: {
+    fontSize: 30,
+    fontWeight: '800',
+    color: Brand.amber,
+    letterSpacing: -0.5,
+  },
+  // « SOS» — visually secondary: same dark colour as «Civic», smaller size
+  wordmarkSos: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: Brand.textDark,
+    letterSpacing: 0.5,
   },
   tagline: {
     fontSize: 15,
