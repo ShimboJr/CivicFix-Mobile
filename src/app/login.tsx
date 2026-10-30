@@ -91,8 +91,10 @@ export default function LoginScreen() {
 
           {/* ── Hero ──────────────────────────────────────────────── */}
           <View style={styles.hero}>
-            {/* Real logo icon — same SVG as web favicon, no accent dot */}
-            <BrandMark size={72} />
+            {/* Current app icon rendered as crisp scalable SVG */}
+            <View style={styles.logoGlow}>
+              <BrandMark size={80} />
+            </View>
 
             {/*
               Two-tone wordmark matching web's .cf-auth-logo markup:
@@ -236,6 +238,16 @@ const styles = StyleSheet.create({
     paddingTop: 52,
     paddingBottom: 28,
     gap: 10,
+  },
+
+  // Soft glow halo behind the logo icon
+  logoGlow: {
+    shadowColor: '#0D9488',
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.35,
+    shadowRadius: 18,
+    elevation: 10,
+    borderRadius: 22,
   },
 
   // ── Wordmark
