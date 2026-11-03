@@ -46,7 +46,6 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
-import * as Location from 'expo-location';
 import Constants from 'expo-constants';
 
 // True when running inside Expo Go (no RECEIVE_BOOT_COMPLETED permission).
@@ -54,16 +53,14 @@ import Constants from 'expo-constants';
 const IS_EXPO_GO = Constants.appOwnership === 'expo';
 
 import {
-  isLocationTrackingActive,
-  startLocationTracking,
   stopLocationTracking,
 } from '@/services/backgroundLocation';
 import {
   confirmSafe,
   endSession,
+  extendSession,
   fetchSessionMessages,
   saveSessionNote,
-  startSession,
   type SessionMessage,
 } from '@/services/liveLocationService';
 import {
@@ -111,7 +108,6 @@ export default function ActiveSessionScreen() {
   const [session, setSession]       = useState<ActiveSessionData | null>(null);
   const [remaining, setRemaining]   = useState(0);
   const [elapsed, setElapsed]       = useState(0);
-  const [pingCount, setPingCount]   = useState(0);
   const [isStopping, setIsStopping] = useState(false);
   const [isExtending, setExtending] = useState(false);
 
@@ -442,7 +438,7 @@ export default function ActiveSessionScreen() {
   function showExtendOptions() {
     Alert.alert(
       'Add More Time',
-      'Extend your session by ending the current one and starting a new one.\n\nLocation tracking will continue without interruption.',
+      'How much time would you like to add?\n\nYour current session, location trail, and admin view will be preserved — no new alert will fire.',
       [
         ...EXTEND_OPTIONS.map((opt) => ({
           text: opt.label,
@@ -457,51 +453,21 @@ export default function ActiveSessionScreen() {
     if (!session) return;
     setExtending(true);
     try {
-      // 1. Get a fresh location fix for the new session's initial point
-      const fix = await Location.getCurrentPositionAsync({
-        accuracy: Location.Accuracy.Balanced,
-      });
+      // PATCH the existing session's expiresAt forward — no new session or
+      // EmergencyReport is created, and no admin notification fires.
+      const { newExpiresAt } = await extendSession(session.sessionId, extraMinutes);
 
-      // 2. End the current backend session
-      await endSession(session.sessionId);
+      // Persist the updated expiry so the background ping task reads it on the
+      // next location event (it checks SecureStore directly).
+      const updated: ActiveSessionData = { ...session, expiresAt: newExpiresAt };
+      await saveActiveSession(updated);
 
-      // 3. Start a new backend session with the added time
-      const newSessionData = await startSession({
-        durationMinutes: extraMinutes,
-        latitude:        fix.coords.latitude,
-        longitude:       fix.coords.longitude,
-        accuracy:        fix.coords.accuracy,
-      });
-
-      // 4. Update SecureStore (background task picks up new sessionId on next ping)
-      const newStored: ActiveSessionData = {
-        sessionId: newSessionData.sessionId,
-        reportId:  newSessionData.reportId,
-        expiresAt: newSessionData.expiresAt,
-      };
-      await saveActiveSession(newStored);
-
-      // 5. Ensure tracking is still running (may have stopped due to 410)
-      const tracking = await isLocationTrackingActive();
-      if (!tracking) await startLocationTracking();
-
-      // 6. Update local state, restart timers, and restart message drain
+      // Restart the countdown timer with the new expiry; everything else
+      // (messages, note, elapsed time, tracking) continues uninterrupted.
       clearTimers();
-      clearMsgDrain();
-      // Reset message state so stale messages from the old session don't linger
-      seenMsgIdsRef.current = new Set();
-      lastSeenMsgAtRef.current = null;
-      setMessages([]);
-      setNewestMsgId(null);
-      setSafeConfirmed(false);
-      setSafeError('');
-      setSession(newStored);
-      elapsedRef.current = 0;
-      setElapsed(0);
-      setRemaining(secondsUntil(newSessionData.expiresAt));
-      setPingCount(0);
-      startTimers(newSessionData.expiresAt);
-      startMsgDrain(newStored.sessionId);
+      setSession(updated);
+      setRemaining(secondsUntil(newExpiresAt));
+      startTimers(newExpiresAt);
 
     } catch (err) {
       Alert.alert(

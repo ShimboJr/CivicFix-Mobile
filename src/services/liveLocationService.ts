@@ -169,6 +169,56 @@ export async function endSession(sessionId: string): Promise<void> {
   }
 }
 
+// ── extendSession ──────────────────────────────────────────────────────────────
+
+/**
+ * Extends an active session's expiry window in-place.
+ *
+ * Calls PATCH /api/live-location/:id/extend — advances `expiresAt` on the
+ * EXISTING session by `additionalMinutes` minutes from its current value.
+ *
+ * Unlike the old "end + start new" approach, this:
+ *   • Keeps the same session ID (background ping task needs no change)
+ *   • Keeps the same EmergencyReport (no second admin alert fires)
+ *   • Preserves the full location trail and all admin messages
+ *
+ * Uses raw `fetch` (no axios timeout) — consistent with all other session
+ * mutation functions in this file.
+ *
+ * Throws on network / server error so the caller can show an inline alert.
+ */
+export async function extendSession(
+  sessionId:         string,
+  additionalMinutes: number,
+): Promise<{ newExpiresAt: string }> {
+  const token = await SecureStore.getItemAsync(StorageKeys.AUTH_TOKEN);
+  if (!token) throw new Error('Not authenticated — please log in again.');
+
+  const url = `${API_BASE_URL}${Endpoints.LIVE_LOCATION_EXTEND(sessionId)}`;
+
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: 'PATCH',
+      headers: {
+        Authorization:  `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ additionalMinutes }),
+    });
+  } catch {
+    throw new Error('Could not connect to the server. Please check your internet connection.');
+  }
+
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({})) as { message?: string };
+    throw new Error(body.message ?? `Failed to extend session (${response.status})`);
+  }
+
+  const body = await response.json() as { newExpiresAt: string };
+  return { newExpiresAt: body.newExpiresAt };
+}
+
 // ── saveSessionNote ────────────────────────────────────────────────────────────
 
 /**

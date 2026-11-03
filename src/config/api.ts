@@ -75,6 +75,16 @@ export const Endpoints = {
   LIVE_LOCATION_END: (sessionId: string) => `/live-location/${sessionId}/end`,
 
   /**
+   * PATCH — extend an active session's expiry window in-place.
+   * Body:    { additionalMinutes: number }
+   * Returns: { message, newExpiresAt }
+   * Access:  session owner only.
+   * ⚠️  Does NOT create a new session or emergency report — the same session,
+   *     same location trail, and same admin view are preserved throughout.
+   */
+  LIVE_LOCATION_EXTEND: (sessionId: string) => `/live-location/${sessionId}/extend`,
+
+  /**
    * PATCH — save a free-text note on the live-location session's linked
    * EmergencyReport (the description field), so admins see it on EmergencyDetail.
    * Body:  { note: string }
