@@ -23,7 +23,13 @@ import { getToken } from '@/services/tokenStore';
 
 const apiClient = axios.create({
   baseURL: API_BASE_URL,
-  timeout: 15000,
+  // 45 s — long enough for a Vercel cold-start + Atlas M0 reconnect (which can
+  // take 10-20 s on a free-tier cluster after an idle period).  The location
+  // ping already uses raw fetch with no timeout and succeeds in these conditions;
+  // the previous 15 s limit was shorter than the cold-start window, causing
+  // axios to abort before a response arrived and reporting the cancellation as a
+  // network error ("Could not connect to the server").
+  timeout: 45000,
   headers: {
     'Content-Type': 'application/json',
     Accept: 'application/json',

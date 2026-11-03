@@ -135,18 +135,37 @@ export async function pingSession(params: PingParams): Promise<PingResult> {
  * Idempotent — the backend silently succeeds even if the session is already
  * ended or expired, so it is safe to call as a cleanup step on app start.
  *
- * Uses the axios instance (foreground-only) because ending a session is always
- * triggered by an explicit user action in the foreground.
+ * Uses raw `fetch` (not the axios instance) for the same reason as pingSession,
+ * saveSessionNote, and confirmSafe: the Vercel + Atlas M0 cold-start can exceed
+ * the previous 15 s axios timeout, causing the request to be silently aborted.
+ * That left the backend session stuck as "active" while the app had already
+ * cleared local state — the admin continued to see the session as active even
+ * though the resident had tapped Stop Sharing.
+ *
+ * Best-effort — network errors are swallowed so the caller's `finally` block
+ * (which stops the location service and clears SecureStore) always runs.
+ * If the call fails due to a transient network error, the session will expire
+ * on its own once expiresAt passes.
  */
 export async function endSession(sessionId: string): Promise<void> {
-  // Best-effort — we don't want a network error to block the UI from clearing
-  // session state and stopping the location service.
+  const token = await SecureStore.getItemAsync(StorageKeys.AUTH_TOKEN);
+  if (!token) return;  // No token → nothing to end on the backend
+
+  const url = `${API_BASE_URL}${Endpoints.LIVE_LOCATION_END(sessionId)}`;
+
   try {
-    await apiClient.post(Endpoints.LIVE_LOCATION_END(sessionId));
+    await fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization:  `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+    });
+    // Response status is not checked — idempotent; 200, 404, 410 are all fine.
+    // A non-2xx from an already-ended session is an acceptable no-op.
   } catch {
-    // Swallow — the foreground service and local state are cleared regardless.
-    // If the call failed due to a transient network error, the session will
-    // expire on its own once expiresAt passes.
+    // Network-level failure — swallow so the caller's cleanup always runs.
+    // The session will auto-expire at expiresAt on the backend.
   }
 }
 
@@ -160,13 +179,42 @@ export async function endSession(sessionId: string): Promise<void> {
  * the EmergencyReport.description field, which is what admins read on
  * EmergencyDetail.jsx.
  *
+ * Uses raw `fetch` (not the axios instance) for the same reason as pingSession:
+ * the Vercel + Atlas M0 cold-start can take 15-25 s after an idle period.
+ * The axios client had a 15 s timeout that fired before the server could
+ * respond, making axios report the cancellation as a network error
+ * ("Could not connect to the server") even though the backend was reachable.
+ * Raw fetch has no built-in timeout and will wait for the response.
+ *
  * Throws on network / server error so the caller can surface the message.
  */
 export async function saveSessionNote(
   sessionId: string,
   note: string,
 ): Promise<void> {
-  await apiClient.patch(Endpoints.LIVE_LOCATION_NOTE(sessionId), { note });
+  const token = await SecureStore.getItemAsync(StorageKeys.AUTH_TOKEN);
+  if (!token) throw new Error('Not authenticated — please log in again.');
+
+  const url = `${API_BASE_URL}${Endpoints.LIVE_LOCATION_NOTE(sessionId)}`;
+
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: 'PATCH',
+      headers: {
+        Authorization:  `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ note }),
+    });
+  } catch {
+    throw new Error('Could not connect to the server. Please check your internet connection.');
+  }
+
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({})) as { message?: string };
+    throw new Error(body.message ?? `Failed to save details (${response.status})`);
+  }
 }
 
 // ── fetchSessionMessages ───────────────────────────────────────────────────────────────────────
@@ -220,8 +268,33 @@ export async function fetchSessionMessages(
  *   It is purely informational — it tells admins the resident acknowledges
  *   their messages.  Location sharing continues completely unaffected.
  *
+ * Uses raw `fetch` (not the axios instance) for the same reason as pingSession
+ * and saveSessionNote: the Vercel + Atlas M0 cold-start can take 15-25 s after
+ * an idle period, longer than the previous axios 15 s timeout.
+ *
  * Throws on network / server error so the caller can show an inline message.
  */
 export async function confirmSafe(sessionId: string): Promise<void> {
-  await apiClient.post(Endpoints.LIVE_LOCATION_CONFIRM_SAFE(sessionId));
+  const token = await SecureStore.getItemAsync(StorageKeys.AUTH_TOKEN);
+  if (!token) throw new Error('Not authenticated — please log in again.');
+
+  const url = `${API_BASE_URL}${Endpoints.LIVE_LOCATION_CONFIRM_SAFE(sessionId)}`;
+
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization:  `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+    });
+  } catch {
+    throw new Error('Could not connect to the server. Please check your internet connection.');
+  }
+
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({})) as { message?: string };
+    throw new Error(body.message ?? `Could not send confirmation (${response.status})`);
+  }
 }

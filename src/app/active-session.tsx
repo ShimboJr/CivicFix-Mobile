@@ -363,17 +363,27 @@ export default function ActiveSessionScreen() {
     clearTimers();
     clearMsgDrain();
     stopPulse();
-    try {
-      if (session) {
-        await endSession(session.sessionId); // best-effort — swallows errors
-      }
-    } finally {
-      await Promise.all([
-        stopLocationTracking(),
-        clearActiveSession(),
-      ]);
-      router.replace('/(app)');
-    }
+
+    // Fire the backend end-session call immediately, but do NOT await it before
+    // cleaning up local state.  endSession() uses raw fetch (no timeout) and is
+    // best-effort — a slow Vercel cold-start used to block here for 15-40 s,
+    // making the Stop button appear frozen and leaving the session "active" on
+    // the backend if the eventual axios timeout fired first.
+    //
+    // Running the two paths in parallel means:
+    //   • The UI navigates home as soon as local cleanup finishes (~100 ms).
+    //   • The fetch keeps running in the background and marks the session
+    //     "ended" on the backend even after navigation — React Native's JS
+    //     thread stays alive long enough for the in-flight fetch to complete.
+    const backendEnd = session ? endSession(session.sessionId) : Promise.resolve();
+
+    await Promise.all([
+      backendEnd,
+      stopLocationTracking(),
+      clearActiveSession(),
+    ]);
+
+    router.replace('/(app)');
   }
 
   // ── "I'm Safe" confirmation ────────────────────────────────────────────────
